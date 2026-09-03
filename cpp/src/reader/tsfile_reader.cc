@@ -19,8 +19,13 @@
 #include "tsfile_reader.h"
 
 #include <stdexcept>
+#include <string>
+#include <vector>
 
+#include "common/allocator/byte_stream.h"
 #include "common/schema.h"
+#include "common/tsfile_common.h"
+#include "file/read_file.h"
 #include "filter/time_operator.h"
 #include "tsfile_executor.h"
 
@@ -34,6 +39,42 @@ struct DeviceMetaEntry {
     int64_t start_offset;
     int64_t end_offset;
 };
+
+int read_chunk_header_codec(ReadFile* read_file, int64_t chunk_header_offset,
+                            size_t measurement_name_len,
+                            common::TSEncoding& encoding,
+                            common::CompressionType& compression) {
+    if (read_file == nullptr || chunk_header_offset < 0) {
+        return E_INVALID_ARG;
+    }
+
+    // A chunk header contains the measurement name before its codec fields.
+    // Read enough bytes for the known name instead of relying on a fixed-size
+    // header buffer.
+    constexpr size_t kMaxVarIntLen = 5;
+    std::vector<char> buffer(1 + kMaxVarIntLen + measurement_name_len +
+                             kMaxVarIntLen + 3);
+    int32_t read_len = 0;
+    int ret = read_file->read(chunk_header_offset, buffer.data(),
+                              static_cast<int32_t>(buffer.size()), read_len);
+    if (ret != E_OK) {
+        return ret;
+    }
+    if (read_len < ChunkHeader::MIN_SERIALIZED_SIZE) {
+        return E_TSFILE_CORRUPTED;
+    }
+
+    common::ByteStream input;
+    input.wrap_from(buffer.data(), read_len);
+    ChunkHeader chunk_header;
+    ret = chunk_header.deserialize_from(input);
+    if (ret != E_OK) {
+        return ret;
+    }
+    encoding = chunk_header.encoding_type_;
+    compression = chunk_header.compression_type_;
+    return E_OK;
+}
 
 int parse_paths(const std::vector<std::string>& path_list,
                 std::vector<Path>& parsed_paths) {
@@ -471,12 +512,39 @@ int TsFileReader::get_timeseries_schema(
                     dt = aligned->value_ts_idx_->get_data_type();
                 }
             }
-            MeasurementSchema ms(
-                timeseries_index->get_measurement_name().to_std_string(), dt);
-            result.push_back(ms);
+            const std::string measurement_name =
+                timeseries_index->get_measurement_name().to_std_string();
+            common::TSEncoding encoding = common::get_value_encoder(dt);
+            common::CompressionType compression =
+                common::get_default_compressor();
+
+            // Aligned indexes keep chunk metadata on the value index; the
+            // base get_chunk_meta_list() is intentionally null for them.
+            auto* chunk_meta_list = timeseries_index->get_chunk_meta_list();
+            if (chunk_meta_list == nullptr) {
+                chunk_meta_list = timeseries_index->get_value_chunk_meta_list();
+            }
+            if (chunk_meta_list != nullptr && !chunk_meta_list->empty() &&
+                chunk_meta_list->back() != nullptr) {
+                common::TSEncoding stored_encoding = common::INVALID_ENCODING;
+                common::CompressionType stored_compression =
+                    common::INVALID_COMPRESSION;
+                ret = read_chunk_header_codec(
+                    tsfile_executor_->get_tsfile_io_reader()->get_read_file(),
+                    chunk_meta_list->back()->offset_of_chunk_header_,
+                    measurement_name.size(), stored_encoding,
+                    stored_compression);
+                if (RET_FAIL(ret)) {
+                    break;
+                }
+                encoding = stored_encoding;
+                compression = stored_compression;
+            }
+
+            result.emplace_back(measurement_name, dt, encoding, compression);
         }
     }
-    return E_OK;
+    return ret;
 }
 
 int TsFileReader::get_timeseries_metadata_impl(

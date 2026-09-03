@@ -112,6 +112,8 @@ class TsFileIOReader {
 
     std::string get_file_path() const { return read_file_->file_path(); }
 
+    ReadFile* get_read_file() const { return read_file_; }
+
     TsFileMeta* get_tsfile_meta() {
         load_tsfile_meta_if_necessary();
         return &tsfile_meta_;
